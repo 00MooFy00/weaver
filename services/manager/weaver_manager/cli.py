@@ -19,11 +19,6 @@ from .ipam import reconcile_ipv6_addresses
 from .proxy_config import render_3proxy_cfg
 from .state_io import write_state_locked
 
-PROXY_CFG_HEADER = (
-    "log /dev/stdout\n"
-    "rotate 0\n"
-)
-
 DEFAULT_CONFIG = Path("/app/config/config.yaml")
 app = typer.Typer(add_completion=False, no_args_is_help=False)
 
@@ -91,7 +86,7 @@ def _apply_impl(config_path: Path, iface: Optional[str]) -> None:
             entries.append((m.port, str(m.ipv6), group_cfg.proxy_type))
 
     bind_egress = (getattr(cfg.global_, "egress_bind", "bind") == "bind")
-    proxy_cfg_text = PROXY_CFG_HEADER + render_3proxy_cfg(entries, cfg.global_.inbound_ipv4_address, bind_egress)
+    proxy_cfg_text = render_3proxy_cfg(entries, cfg.global_.inbound_ipv4_address, bind_egress)
     Path(cfg.global_.proxy_config_path).write_text(proxy_cfg_text, encoding="utf-8")
     write_state_locked(str(Path(cfg.global_.state_file_path)), new_state.dict())
     _restart_proxy_via_docker_api()
