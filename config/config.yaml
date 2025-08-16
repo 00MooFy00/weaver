@@ -1,0 +1,76 @@
+global:
+  egress_bind: "auto"
+  state_file_path: /app/state/state.json
+  proxy_config_path: /app/config/3proxy.cfg
+  ipv6_interface: auto              # на проде autodetect найдёт eth0/ens3 и т.п.
+  inbound_ipv4_address: "0.0.0.0"
+
+  allocator:
+    probe_enabled: true
+    probe_targets: # несколько целей на случай блокировок/фильтров
+      - "api64.ipify.org:443"
+      - "ipv6.google.com:443"
+      - "example.com:443"
+    probe_timeout_ms: 1500
+    probe_retries: 2
+    concurrent_probes: 64
+
+  nf_table: weaver
+  nf_chain_out: out
+  nf_policy_accept: true
+
+  reconcile_remove_extras: false
+  pinned_ipv6: []
+
+  handler:
+    on_error: accept
+    health_window_sec: 60
+    persona_pool:
+      - target_android_14
+      - draft_windows_11
+      - draft_ios_17
+    persona_weights:
+      target_android_14: 0.6
+      draft_windows_11: 0.2
+      draft_ios_17: 0.2
+
+personas:
+  target_android_14:
+    ttl: 64
+    window_size: 65535
+    tcp_options_layout:
+      - { name: MSS, value: "calc" }
+      - { name: SACK }
+      - { name: Timestamps }
+      - { name: NOP }
+      - { name: WScale, value: "7" }
+
+  draft_windows_11:
+    ttl: 128
+    window_size: 64240
+    tcp_options_layout:
+      - { name: MSS, value: "calc" }
+      - { name: SACK }
+      - { name: NOP }
+      - { name: WScale, value: "8" }
+      - { name: NOP }
+      - { name: NOP }
+
+  draft_ios_17:
+    ttl: 64
+    window_size: 65535
+    tcp_options_layout:
+      - { name: MSS, value: "calc" }
+      - { name: SACK }
+      - { name: Timestamps }
+      - { name: NOP }
+      - { name: WScale, value: "6" }
+
+proxy_groups:
+  - name: "android-pool-1"
+    ipv6_subnet: "2a01:4f8:c0c:1234::/64"
+    count: 10000
+    proxy_type: "http"
+    port_range: { start: 30000, end: 30999 }
+    persona: "target_android_14"
+    nfqueue_num: 0

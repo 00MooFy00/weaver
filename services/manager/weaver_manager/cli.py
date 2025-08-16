@@ -85,7 +85,8 @@ def _apply_impl(config_path: Path, iface: Optional[str]) -> None:
         for m in gs.mappings:
             entries.append((m.port, str(m.ipv6), group_cfg.proxy_type))
 
-    bind_egress = (getattr(cfg.global_, "egress_bind", "bind") == "bind")
+    eb = str(getattr(cfg.global_, "egress_bind", "bind")).lower()
+    bind_egress = eb in ("bind", "auto")
     proxy_cfg_text = render_3proxy_cfg(entries, cfg.global_.inbound_ipv4_address, bind_egress)
     Path(cfg.global_.proxy_config_path).write_text(proxy_cfg_text, encoding="utf-8")
     write_state_locked(str(Path(cfg.global_.state_file_path)), new_state.dict())
