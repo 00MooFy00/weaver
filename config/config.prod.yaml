@@ -1,4 +1,5 @@
 global:
+  egress_bind: "auto"
   state_file_path: /app/state/state.json
   proxy_config_path: /app/config/3proxy.cfg
   ipv6_interface: auto              # на проде autodetect найдёт eth0/ens3 и т.п.

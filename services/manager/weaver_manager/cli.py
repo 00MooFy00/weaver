@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, subprocess, urllib.parse
+import json, subprocess, urllib.parse, shlex
 from pathlib import Path
 from typing import Optional
 
@@ -90,59 +90,36 @@ def _apply_impl(config_path: Path, iface: Optional[str]) -> None:
         for m in gs.mappings:
             entries.append((m.port, str(m.ipv6), group_cfg.proxy_type))
 
-    proxy_cfg_text = PROXY_CFG_HEADER + render_3proxy_cfg(entries, cfg.global_.inbound_ipv4_address)
+    bind_egress = (getattr(cfg.global_, "egress_bind", "bind") == "bind")
+    proxy_cfg_text = PROXY_CFG_HEADER + render_3proxy_cfg(entries, cfg.global_.inbound_ipv4_address, bind_egress)
     Path(cfg.global_.proxy_config_path).write_text(proxy_cfg_text, encoding="utf-8")
     write_state_locked(str(Path(cfg.global_.state_file_path)), new_state.dict())
     _restart_proxy_via_docker_api()
     print("Manager apply: done")
 
-def _restart_proxy_via_docker_api() -> None:
-    try:
-        filters = json.dumps({
-            "label": [
-                "com.docker.compose.project=weaver",
-                "com.docker.compose.service=proxy"
-            ]
-        })
-        url = f"http://localhost/v1.45/containers/json?filters={urllib.parse.quote(filters)}"
-        out = subprocess.run(
-            ["curl", "--fail", "--silent", "--unix-socket", "/var/run/docker.sock", "--globoff", url],
-            check=True, capture_output=True, text=True
-        ).stdout
-        arr = json.loads(out)
-        if not arr:
-            print("[manager] proxy restart via Docker API: container not found")
-            return
-        cid = arr[0]["Id"]
-        subprocess.run(
-            ["curl", "-X", "POST", "--fail", "--silent", "--unix-socket", "/var/run/docker.sock",
-             f"http://localhost/v1.45/containers/{cid}/restart"],
-            check=True
-        )
-        print("[manager] proxy restart via Docker API: restarted 1 container(s)")
-    except Exception as e:
-        print(f"[manager] proxy restart via Docker API failed: {e}")
 
-def _restart_proxy_via_docker_api() -> None:
+def _docker_api(path: str, params: dict | None = None, method: str = "GET") -> str:
     sock = "/var/run/docker.sock"
-    base = "http://localhost/v1.45"
+    base = "http://localhost"
+    cmd = ["curl", "--fail", "--silent", "--unix-socket", sock]
+    if method != "GET":
+        cmd += ["-X", method]
+    url = f"{base}{path}"
+    if params:
+        cmd += ["--get"]
+        for k, v in params.items():
+            cmd += ["--data-urlencode", f"{k}={v}"]
+    cmd += [url]
+    return subprocess.check_output(cmd, text=True)
 
-    def _curl(args, **kw):
-        return subprocess.run(args, check=False, capture_output=True, text=True, **kw)
+def _restart_proxy_via_docker_api():
+    try:
+        ver = json.loads(_docker_api("/version")).get("ApiVersion", "v1.41")
+        if not ver.startswith("v"):
+            ver = "v" + ver
+    except Exception:
+        ver = "v1.41"
 
-    ping = _curl(["curl","--silent","--unix-socket",sock,f"{base}/_ping"])
-    if ping.returncode != 0:
-        print(f"[manager] Docker API not reachable on {sock}: {ping.stderr or ping.stdout}".strip())
-        return
-
-    # 1) пробуем рестарт по "стабильному" имени compose-контейнера без фильтров
-    for name in ("weaver-proxy-1", "proxy-1", "proxy"):
-        r = _curl(["curl","--fail","--silent","--unix-socket",sock,"-X","POST",f"{base}/containers/{name}/restart"])
-        if r.returncode == 0:
-            print(f"[manager] proxy restart via Docker API: restarted container '{name}'")
-            return
-
-    # 2) если имя не сработало — ищем по label фильтрам через --get/--data-urlencode
     filters = json.dumps({
         "label": [
             "com.docker.compose.project=weaver",
@@ -150,35 +127,26 @@ def _restart_proxy_via_docker_api() -> None:
         ]
     })
 
-    rlist = _curl([
-        "curl","--fail","--silent","--unix-socket",sock,"--get", f"{base}/containers/json",
-        "--data-urlencode", f"filters={filters}"
-    ])
-    if rlist.returncode != 0:
-        print(f"[manager] proxy list via Docker API failed: {rlist.stderr or rlist.stdout}".strip())
-        return
-
     try:
-        arr = json.loads(rlist.stdout)
+        data = _docker_api(f"/{ver}/containers/json", {"filters": filters})
+        arr = json.loads(data)
     except Exception as e:
-        print(f"[manager] proxy list parse failed: {e}")
+        print("[manager] proxy list via Docker API failed:", e)
         return
 
     if not arr:
-        print("[manager] proxy restart via Docker API: container not found")
+        print("[manager] proxy list via Docker API: no containers found")
         return
 
-    cid = arr[0].get("Id")
-    if not cid:
-        print("[manager] proxy restart via Docker API: bad response (no Id)")
-        return
-
-    rrest = _curl(["curl","--fail","--silent","--unix-socket",sock,"-X","POST",f"{base}/containers/{cid}/restart"])
-    if rrest.returncode == 0:
-        print("[manager] proxy restart via Docker API: restarted 1 container(s)")
-    else:
-        print(f"[manager] proxy restart via Docker API failed: {rrest.stderr or rrest.stdout}".strip())
-
+    for c in arr:
+        cid = c.get("Id")
+        if not cid:
+            continue
+        try:
+            _docker_api(f"/{ver}/containers/{cid}/restart", method="POST")
+            print(f"[manager] proxy restart via Docker API: restarted container '{cid[:12]}'")
+        except Exception as e:
+            print(f"[manager] proxy restart via Docker API: failed for {cid[:12]}:", e)
 
 def _restart_proxy_via_cli_fallback() -> None:
     import shutil, subprocess
