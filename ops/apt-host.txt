@@ -1,0 +1,16 @@
+# Базовые вещи (удобно для любой Ubuntu/Debian)
+ca-certificates
+curl
+gnupg
+lsb-release
+jq
+
+# Docker CE и плагины (через официальный репозиторий Docker)
+docker-ce
+docker-ce-cli
+containerd.io
+docker-compose-plugin
+docker-buildx-plugin
+
+# (опционально) для диагностики сети; НЕ обязательны для работы проекта
+tcpdump
