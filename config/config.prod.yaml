@@ -3,7 +3,17 @@ global:
   state_file_path: /app/state/state.json
   proxy_config_path: /app/config/3proxy.cfg
   ipv6_interface: auto              # на проде autodetect найдёт eth0/ens3 и т.п.
-  inbound_ipv4_address: "127.0.0.1"
+  inbound_ipv4_address: "0.0.0.0"
+
+  allocator:
+    probe_enabled: true
+    probe_targets: # несколько целей на случай блокировок/фильтров
+      - "api64.ipify.org:443"
+      - "ipv6.google.com:443"
+      - "example.com:443"
+    probe_timeout_ms: 1500
+    probe_retries: 2
+    concurrent_probes: 64
 
   nf_table: weaver
   nf_chain_out: out

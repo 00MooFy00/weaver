@@ -3,6 +3,7 @@ import subprocess
 from typing import Sequence, List
 from ipaddress import IPv6Address, IPv6Network
 
+MIN_IID_DEFAULT = 0x100
 
 def _run(args: Sequence[str]) -> None:
     subprocess.run(list(args), check=True)
@@ -55,15 +56,21 @@ def ensure_ipv6_addresses(interface: str, addrs: List[IPv6Address]) -> None:
             _run(["ip", "-6", "addr", "add", f"{s}/128", "dev", interface, "nodad"])
 
 
-def generate_ipv6_hosts(subnet: IPv6Network, count: int) -> List[IPv6Address]:
+def generate_ipv6_hosts(subnet: IPv6Network, count: int, min_iid: int = MIN_IID_DEFAULT) -> List[IPv6Address]:
     hosts: List[IPv6Address] = []
     base = int(subnet.network_address)
-    for i in range(1, count + 1):
-        ip_int = base + i
+    max_iid = (1 << (128 - subnet.prefixlen)) - 1
+    start = min_iid if min_iid <= max_iid else 1
+    for ofs in range(start, start + count):
+        ip_int = base + ofs
         ip = IPv6Address(ip_int)
         if ip not in subnet:
             break
         hosts.append(ip)
+    if len(hosts) < count:
+        raise RuntimeError(
+            f"generate_ipv6_hosts: only {len(hosts)} addresses available in {subnet} from IID 0x{start:x}"
+        )
     return hosts
 
 
@@ -108,8 +115,13 @@ def ensure_v6_set(table: str, set_name: str) -> None:
 def replace_v6_set_elems(table: str, set_name: str, elems: List[str]) -> None:
     ensure_v6_set(table, set_name)
     _run(["nft","flush","set","inet",table,set_name])
-    if elems:
-        _run(["nft","add","element","inet",table,set_name,"{",",".join(elems),"}"])
+    if not elems:
+        return
+    CHUNK = 512
+    for i in range(0, len(elems), CHUNK):
+        chunk = elems[i:i+CHUNK]
+        _run(["nft","add","element","inet",table,set_name,"{",",".join(chunk),"}"])
+
 
 def ensure_queue_rule(table: str, chain_out: str, set_name: str, nfqueue_num: int) -> None:
     text = _cap(["nft", "list", "chain", "inet", table, chain_out])
