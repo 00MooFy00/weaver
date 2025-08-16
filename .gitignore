@@ -1,0 +1,34 @@
+# ---- Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+.build/
+dist/
+pip-wheel-metadata/
+*.log
+.pytest_cache/
+.mypy_cache/
+
+# ---- Виртуальные окружения
+.venv/
+venv/
+env/
+
+# ---- IDE/OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ---- Docker / Compose
+*.env
+docker-compose.override.yaml
+
+# ---- Артефакты проекта (генерятся менеджером)
+config/3proxy.cfg
+state/*
+!state/.gitkeep

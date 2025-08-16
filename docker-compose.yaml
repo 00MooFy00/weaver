@@ -1,0 +1,45 @@
+services:
+  manager:
+    build:
+      context: .
+      dockerfile: services/manager/Dockerfile
+    image: weaver/manager:latest
+    network_mode: "host"
+    cap_add: [ "NET_ADMIN", "NET_RAW" ]
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./config:/app/config
+      - ./state:/app/state
+      - /var/run/docker.sock:/var/run/docker.sock  # для рестарта proxy через докер апи
+    entrypoint: ["/app/entrypoint.sh"]
+
+  handler:
+    build:
+      context: .
+      dockerfile: services/handler/Dockerfile
+    image: weaver/handler:latest
+    network_mode: "host"
+    cap_add: [ "NET_ADMIN", "NET_RAW" ]
+    restart: always
+    environment:
+      - PYTHONUNBUFFERED=1
+      - WEAVER_HANDLER_HEALTH_HOST=${WEAVER_HANDLER_HEALTH_HOST}
+      - WEAVER_HANDLER_HEALTH_PORT=${WEAVER_HANDLER_HEALTH_PORT}
+      - WEAVER_HANDLER_HEALTH_WINDOW_SEC=${WEAVER_HANDLER_HEALTH_WINDOW_SEC}
+      - WEAVER_HANDLER_FORCE_VALUES=${WEAVER_HANDLER_FORCE_VALUES}
+      - WEAVER_HANDLER_IPV6_MSS=${WEAVER_HANDLER_IPV6_MSS}
+    volumes:
+      - ./config:/app/config
+    entrypoint: [ "/app/entrypoint.sh" ]
+
+  proxy:
+    build:
+      context: .
+      dockerfile: services/proxy/Dockerfile
+    image: weaver/3proxy:0.9.4
+    network_mode: "host"
+    restart: always
+    volumes:
+      - ./config:/app/config
+    entrypoint: ["/app/entrypoint.sh"]

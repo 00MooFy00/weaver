@@ -1,0 +1,12 @@
+services:
+  manager:
+    volumes:
+      - ./config/config.lab.yaml:/app/config/config.yaml:ro
+
+  proxy:
+    volumes:
+      - ./config/config.lab.yaml:/app/config/config.yaml:ro
+
+  handler:
+    volumes:
+      - ./config/config.lab.yaml:/app/config/config.yaml:ro

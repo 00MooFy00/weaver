@@ -1,0 +1,5 @@
+scapy==2.5.0
+NetfilterQueue==1.0.0
+pydantic==2.7.1
+PyYAML==6.0.2
+rich
