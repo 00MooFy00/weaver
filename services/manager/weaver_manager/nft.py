@@ -69,43 +69,6 @@ def generate_ipv6_hosts(subnet: IPv6Network, count: int) -> List[IPv6Address]:
         hosts.append(ip)
     return hosts
 
-# -------- nftables --------
-
-def purge_table(table: str) -> None:
-    # тихо: нет - так нет
-    if _run_ok(["nft", "list", "table", "inet", table]):
-        subprocess.run(["nft", "flush", "table", "inet", table],
-                       check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["nft", "delete", "table", "inet", table],
-                       check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-def ensure_table_chain(table: str, chain_out: str, policy_accept: bool) -> None:
-    if not _run_ok(["nft", "list", "table", "inet", table]):
-        _run(["nft", "add", "table", "inet", table])
-
-    have_chain = _run_ok(["nft", "list", "chain", "inet", table, chain_out])
-    if not have_chain:
-        pol = "accept" if policy_accept else "drop"
-        _run([
-            "nft","add","chain","inet",table,chain_out,
-            "{","type","filter","hook","output","priority","filter",";","policy",pol,";","}"
-        ])
-    else:
-        # при необходимости можно поправить policy
-        text = subprocess.run(["nft","list","chain","inet",table,chain_out],
-                              check=False, capture_output=True, text=True).stdout or ""
-        need = "policy accept" if policy_accept else "policy drop"
-        if need not in text:
-            pol = "accept" if policy_accept else "drop"
-            _run(["nft","flush","chain","inet",table,chain_out])
-            _run([
-                "nft","add","chain","inet",table,chain_out,
-                "{","type","filter","hook","output","priority","filter",";","policy",pol,";","}"
-            ])
-
-def ensure_v6_set(table: str, set_name: str) -> None:
-    if not _run_ok(["nft","list","set","inet",table,set_name]):
-        _run(["nft","add","set","inet",table,set_name,"{","type","ipv6_addr",";","}"])
 
 def _delete_rules_ref_set(table: str, chain: str, set_name: str) -> None:
     """
@@ -212,6 +175,87 @@ def replace_v6_set_from_subnets(
 
     # Убедимся, что стоит правильное queue‑правило
     ensure_queue_rule(table, chain_for_cleanup, set_name, nfqueue_num)
+
+# -------- nftables --------
+
+def purge_table(table: str) -> None:
+    # тихо: нет - так нет
+    if _run_ok(["nft", "list", "table", "inet", table]):
+        subprocess.run(["nft", "flush", "table", "inet", table],
+                       check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["nft", "delete", "table", "inet", table],
+                       check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def ensure_table_chain(table: str, chain_out: str, policy_accept: bool) -> None:
+    if not _run_ok(["nft", "list", "table", "inet", table]):
+        _run(["nft", "add", "table", "inet", table])
+
+    have_chain = _run_ok(["nft", "list", "chain", "inet", table, chain_out])
+    if not have_chain:
+        pol = "accept" if policy_accept else "drop"
+        _run([
+            "nft","add","chain","inet",table,chain_out,
+            "{","type","filter","hook","output","priority","filter",";","policy",pol,";","}"
+        ])
+    else:
+        # при необходимости можно поправить policy
+        text = subprocess.run(["nft","list","chain","inet",table,chain_out],
+                              check=False, capture_output=True, text=True).stdout or ""
+        need = "policy accept" if policy_accept else "policy drop"
+        if need not in text:
+            pol = "accept" if policy_accept else "drop"
+            _run(["nft","flush","chain","inet",table,chain_out])
+            _run([
+                "nft","add","chain","inet",table,chain_out,
+                "{","type","filter","hook","output","priority","filter",";","policy",pol,";","}"
+            ])
+
+def ensure_v6_set(table: str, set_name: str) -> None:
+    if not _run_ok(["nft","list","set","inet",table,set_name]):
+        _run(["nft","add","set","inet",table,set_name,"{","type","ipv6_addr",";","}"])
+
+def replace_v6_set_elems(table: str, set_name: str, elems: List[str]) -> None:
+    ensure_v6_set(table, set_name)
+    _run(["nft","flush","set","inet",table,set_name])
+    if elems:
+        _run(["nft","add","element","inet",table,set_name,"{",",".join(elems),"}"])
+    """
+    Полная замена содержимого набора IPv6-адресов с безопасной загрузкой больших списков.
+    Чанк размером настраивается переменной окружения WEAVER_NFT_CHUNK (по умолчанию 256).
+    При E2BIG (слишком длинный argv) — фоллбэк через 'nft -f <tempfile>'.
+    """
+    ensure_v6_set(table, set_name)
+    _run(["nft", "flush", "set", "inet", table, set_name])
+    if not elems:
+        return
+
+    try:
+        chunk_sz = int(os.environ.get("WEAVER_NFT_CHUNK", "256"))
+    except Exception:
+        chunk_sz = 256
+    chunk_sz = max(16, min(2048, chunk_sz))
+
+    for i in range(0, len(elems), chunk_sz):
+        chunk = elems[i:i + chunk_sz]
+        cmd = ["nft", "add", "element", "inet", table, set_name, "{", ",".join(chunk), "}"]
+        try:
+            _run(cmd)
+        except OSError as e:
+            # На всякий: если всё равно упираемся в длину argv — обходим через -f
+            if e.errno != errno.E2BIG:
+                raise
+            payload = f"add element inet {table} {set_name} {{ {','.join(chunk)} }}\n"
+            with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as tf:
+                tf.write(payload)
+                tf.flush()
+                tmp = tf.name
+            try:
+                _run(["nft", "-f", tmp])
+            finally:
+                try:
+                    os.unlink(tmp)
+                except FileNotFoundError:
+                    pass
 
 def ensure_queue_rule(table: str, chain_out: str, set_name: str, nfqueue_num: int) -> None:
     text = _cap(["nft", "list", "chain", "inet", table, chain_out])
