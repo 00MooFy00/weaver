@@ -1,5 +1,8 @@
 from __future__ import annotations
 import subprocess
+import tempfile
+import errno
+import os
 from typing import Sequence, List
 from ipaddress import IPv6Address, IPv6Network
 
@@ -110,6 +113,43 @@ def replace_v6_set_elems(table: str, set_name: str, elems: List[str]) -> None:
     _run(["nft","flush","set","inet",table,set_name])
     if elems:
         _run(["nft","add","element","inet",table,set_name,"{",",".join(elems),"}"])
+    """
+    Полная замена содержимого набора IPv6-адресов с безопасной загрузкой больших списков.
+    Чанк размером настраивается переменной окружения WEAVER_NFT_CHUNK (по умолчанию 256).
+    При E2BIG (слишком длинный argv) — фоллбэк через 'nft -f <tempfile>'.
+    """
+    ensure_v6_set(table, set_name)
+    _run(["nft", "flush", "set", "inet", table, set_name])
+    if not elems:
+        return
+
+    try:
+        chunk_sz = int(os.environ.get("WEAVER_NFT_CHUNK", "256"))
+    except Exception:
+        chunk_sz = 256
+    chunk_sz = max(16, min(2048, chunk_sz))
+
+    for i in range(0, len(elems), chunk_sz):
+        chunk = elems[i:i + chunk_sz]
+        cmd = ["nft", "add", "element", "inet", table, set_name, "{", ",".join(chunk), "}"]
+        try:
+            _run(cmd)
+        except OSError as e:
+            # На всякий: если всё равно упираемся в длину argv — обходим через -f
+            if e.errno != errno.E2BIG:
+                raise
+            payload = f"add element inet {table} {set_name} {{ {','.join(chunk)} }}\n"
+            with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as tf:
+                tf.write(payload)
+                tf.flush()
+                tmp = tf.name
+            try:
+                _run(["nft", "-f", tmp])
+            finally:
+                try:
+                    os.unlink(tmp)
+                except FileNotFoundError:
+                    pass
 
 def ensure_queue_rule(table: str, chain_out: str, set_name: str, nfqueue_num: int) -> None:
     text = _cap(["nft", "list", "chain", "inet", table, chain_out])
