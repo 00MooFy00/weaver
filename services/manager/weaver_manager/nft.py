@@ -69,7 +69,6 @@ def generate_ipv6_hosts(subnet: IPv6Network, count: int) -> List[IPv6Address]:
         hosts.append(ip)
     return hosts
 
-
 # -------- nftables --------
 
 def purge_table(table: str) -> None:
@@ -108,34 +107,94 @@ def ensure_v6_set(table: str, set_name: str) -> None:
     if not _run_ok(["nft","list","set","inet",table,set_name]):
         _run(["nft","add","set","inet",table,set_name,"{","type","ipv6_addr",";","}"])
 
-def replace_v6_set_elems(table: str, set_name: str, elems: List[str]) -> None:
-    ensure_v6_set(table, set_name)
-    _run(["nft","flush","set","inet",table,set_name])
-    if elems:
-        _run(["nft","add","element","inet",table,set_name,"{",",".join(elems),"}"])
+def _delete_rules_ref_set(table: str, chain: str, set_name: str) -> None:
     """
-    Полная замена содержимого набора IPv6-адресов с безопасной загрузкой больших списков.
-    Чанк размером настраивается переменной окружения WEAVER_NFT_CHUNK (по умолчанию 256).
-    При E2BIG (слишком длинный argv) — фоллбэк через 'nft -f <tempfile>'.
+    Удалить все правила в цепочке, которые ссылаются на @set_name.
+    Используем вывод с handle'ами: `nft -a list chain inet <table> <chain>`.
     """
-    ensure_v6_set(table, set_name)
-    _run(["nft", "flush", "set", "inet", table, set_name])
-    if not elems:
+    try:
+        cp = subprocess.run(
+            ["nft", "-a", "list", "chain", "inet", table, chain],
+            capture_output=True, text=True, check=True
+        )
+    except subprocess.CalledProcessError:
         return
 
+    for line in cp.stdout.splitlines():
+        if f"@{set_name}" in line:
+            m = re.search(r"handle\s+(\d+)", line)
+            if m:
+                handle = m.group(1)
+                _run(["nft", "delete", "rule", "inet", table, chain, "handle", handle])
+
+
+def ensure_v6_interval_set(table: str, set_name: str, chain_for_cleanup: Optional[str] = None) -> None:
+    """
+    Гарантировать существование сета типа ipv6_addr с `flags interval`.
+    Если сет уже есть, но без interval — удалим правила, удалим сет и создадим заново.
+    """
+    # Есть ли сет?
+    exists = _run_ok(["nft", "list", "set", "inet", table, set_name])
+    if exists:
+        # Проверяем, не уже ли он interval
+        cp = subprocess.run(
+            ["nft", "list", "set", "inet", table, set_name],
+            capture_output=True, text=True
+        )
+        if "flags interval" in cp.stdout:
+            return
+        # Приведём к interval: сперва уберём правила, которые на него ссылаются
+        if chain_for_cleanup:
+            _delete_rules_ref_set(table, chain_for_cleanup, set_name)
+        # Затем удалим и пересоздадим сет
+        _run(["nft", "delete", "set", "inet", table, set_name])
+
+    # Создаём interval‑сет (idempotent: если уже есть — _run_ok просто вернёт False/True)
+    _run_ok([
+        "nft", "add", "set", "inet", table, set_name,
+        "{", "type", "ipv6_addr", ";", "flags", "interval", ";", "}"
+    ])
+
+
+def replace_v6_set_from_subnets(
+    table: str,
+    set_name: str,
+    subnets: List[str],
+    chain_for_cleanup: str,
+    nfqueue_num: int
+) -> None:
+    """
+    Полностью заменить содержимое сета диапазонами (префиксами).
+    Обеспечивает `flags interval`, очищает сет и заливает элементы чанками.
+    В конце гарантирует наличие queue‑правила.
+    """
+    from weaver_manager.nft import ensure_queue_rule  # локальный импорт, чтобы избежать циклов
+
+    ensure_v6_interval_set(table, set_name, chain_for_cleanup)
+
+    # Чистим сет
+    _run(["nft", "flush", "set", "inet", table, set_name])
+
+    if not subnets:
+        ensure_queue_rule(table, chain_for_cleanup, set_name, nfqueue_num)
+        return
+
+    # Размер чанка (как и в адресном варианте)
     try:
         chunk_sz = int(os.environ.get("WEAVER_NFT_CHUNK", "256"))
     except Exception:
         chunk_sz = 256
     chunk_sz = max(16, min(2048, chunk_sz))
 
-    for i in range(0, len(elems), chunk_sz):
-        chunk = elems[i:i + chunk_sz]
+    print(f"[manager] nft add prefixes in chunks: size={chunk_sz}, total={len(subnets)}")
+
+    # Заливаем чанками; при E2BIG — через временный файл
+    for i in range(0, len(subnets), chunk_sz):
+        chunk = subnets[i:i + chunk_sz]
         cmd = ["nft", "add", "element", "inet", table, set_name, "{", ",".join(chunk), "}"]
         try:
             _run(cmd)
         except OSError as e:
-            # На всякий: если всё равно упираемся в длину argv — обходим через -f
             if e.errno != errno.E2BIG:
                 raise
             payload = f"add element inet {table} {set_name} {{ {','.join(chunk)} }}\n"
@@ -150,6 +209,9 @@ def replace_v6_set_elems(table: str, set_name: str, elems: List[str]) -> None:
                     os.unlink(tmp)
                 except FileNotFoundError:
                     pass
+
+    # Убедимся, что стоит правильное queue‑правило
+    ensure_queue_rule(table, chain_for_cleanup, set_name, nfqueue_num)
 
 def ensure_queue_rule(table: str, chain_out: str, set_name: str, nfqueue_num: int) -> None:
     text = _cap(["nft", "list", "chain", "inet", table, chain_out])
