@@ -14,6 +14,7 @@ from .nft import (
     replace_v6_set_elems,
     ensure_queue_rule,
     generate_ipv6_hosts,
+    replace_v6_set_from_subnets
 )
 from .ipam import reconcile_ipv6_addresses
 from .proxy_config import render_3proxy_cfg
@@ -72,10 +73,29 @@ def _apply_impl(config_path: Path, iface: Optional[str]) -> None:
     # 3) nft: полная чистка и пересоздание
     purge_table(cfg.global_.nf_table)
     ensure_table_chain(cfg.global_.nf_table, cfg.global_.nf_chain_out, cfg.global_.nf_policy_accept)
+    # Быстрый доступ к исходным группам из конфигурации (там есть ipv6_subnet)
+    pg_by_name = {pg.name: pg for pg in cfg.proxy_groups}
+
+    use_subnet_set = os.environ.get("WEAVER_USE_SUBNET_SET", "0").lower() in ("1", "true", "yes")
+
     for gs in new_state.groups.values():
         set_name = f"{gs.name}_src"
-        saddr_list = [str(m.ipv6) for m in gs.mappings]
-        replace_v6_set_elems(cfg.global_.nf_table, set_name, saddr_list)
+
+        if use_subnet_set:
+            subnet = str(pg_by_name[gs.name].ipv6_subnet)  # например, "2a01:4f8:c0c:1234::/64"
+            replace_v6_set_from_subnets(
+                cfg.global_.nf_table,
+                set_name,
+                [subnet],
+                cfg.global_.nf_chain_out,
+                gs.nfqueue_num
+            )
+        else:
+            # Старый режим: все хост‑адреса (с твоей уже исправленной чанк‑загрузкой)
+            saddr_list = [str(m.ipv6) for m in gs.mappings]
+            replace_v6_set_elems(cfg.global_.nf_table, set_name, saddr_list)
+
+        # На всякий — гарантируем правило (в режиме префикса оно уже ставится, но вызов идемпотентный)
         ensure_queue_rule(cfg.global_.nf_table, cfg.global_.nf_chain_out, set_name, gs.nfqueue_num)
 
     # 4) 3proxy.cfg
