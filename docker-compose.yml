@@ -1,0 +1,54 @@
+version: "3.9"
+
+services:
+  # 3proxy — по умолчанию в host-сети (быстро и просто).
+  # Альтернативы без host-сети см. в README (macvlan/tproxy).
+  proxy:
+    build: ./services/proxy
+    container_name: weaver-proxy
+    network_mode: host
+    user: "1337:1337" # UID/GID процесса 3proxy, см. nft rules по skuid
+    volumes:
+      - ./config/3proxy.cfg:/etc/3proxy/3proxy.cfg:ro
+    restart: unless-stopped
+    environment:
+      - TZ=UTC
+    cap_add:
+      - NET_BIND_SERVICE
+
+  # manager — однократно применяет конфигурацию (IPAM, nftables, 3proxy.cfg).
+  # Не требует доступа к docker.sock и не использует host-сеть.
+  manager:
+    build: ./services/manager
+    container_name: weaver-manager
+    pid: host                    # нужен доступ к /proc/1/ns/net
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_ADMIN               # для nsenter в host netns
+    environment:
+      - CONFIG_PATH=/app/config/config.yaml
+    volumes:
+      - ./config:/app/config:rw
+      - ./state:/app/state:rw
+    # Запуск on-demand: docker compose run --rm manager apply
+    entrypoint: ["/entrypoint.sh"]
+    command: ["sleep", "infinity"]
+
+  # handler — долговременный сервис, слушает NFQUEUE в host netns и публикует /health
+  handler:
+    build: ./services/handler
+    container_name: weaver-handler
+    pid: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_ADMIN
+    environment:
+      - CONFIG_PATH=/app/config/config.yaml
+    volumes:
+      - ./config:/app/config:ro
+    restart: always
+    entrypoint: ["/entrypoint.sh"]
+
+networks: {}

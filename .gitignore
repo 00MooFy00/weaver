@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+.build/
+dist/
+.venv/
+venv/
+
+# Testing / tools
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+
+# Docker
+*.log
+**/.env
+**/.env.*
+
+# Project generated
+config/3proxy.cfg
+state/state.json
