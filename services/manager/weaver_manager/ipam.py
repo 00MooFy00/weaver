@@ -1,49 +1,66 @@
-import ipaddress
-import os
-import random
-from typing import Dict, List, Set, Tuple
-from pyroute2 import IPRoute
+from __future__ import annotations
 
-def _rand_host_in_subnet(subnet: ipaddress.IPv6Network) -> ipaddress.IPv6Address:
-    # исключаем сетевой адрес, генерируем нижние 64 бита (для /64)
-    host_bits = subnet.max_prefixlen - subnet.prefixlen
-    rnd = random.getrandbits(host_bits)
-    return ipaddress.IPv6Address(int(subnet.network_address) + rnd)
+import subprocess
+from ipaddress import IPv6Network
+from typing import Iterable, List, Set, Tuple
 
-def allocate_random_ipv6(subnet_str: str, want: int, reserved: Set[str]) -> List[str]:
-    subnet = ipaddress.IPv6Network(subnet_str, strict=False)
-    out: Set[str] = set()
-    attempts = 0
-    while len(out) < want:
-        attempts += 1
-        if attempts > want * 100:
-            raise RuntimeError("cannot allocate enough unique IPv6 addresses")
-        cand = str(_rand_host_in_subnet(subnet))
-        if cand in reserved or cand in out:
-            continue
-        out.add(cand)
-    return list(out)
 
-def ensure_addrs_on_iface(ifname: str, desired: Set[str]) -> Tuple[Set[str], Set[str]]:
+def generate_ipv6_hosts(subnet: str, count: int) -> List[str]:
     """
-    Приводит список /128 на интерфейсе к desired. Возвращает (added, removed).
+    Детерминированно выдаёт первые `count` адресов /128 в подсети (пропуская ::).
     """
-    ipr = IPRoute()
-    idx_list = ipr.link_lookup(ifname=ifname)
-    if not idx_list:
-        raise RuntimeError(f"interface {ifname} not found")
-    idx = idx_list[0]
-    present: Set[str] = set()
-    for addr in ipr.get_addr(index=idx, family=10):  # AF_INET6
-        attrs = dict(addr.get('attrs', []))
-        ip = attrs.get('IFA_ADDRESS')
-        plen = addr.get('prefixlen')
-        if ip and plen == 128:
-            present.add(ip)
-    to_add = desired - present
-    to_del = present - desired
-    for ip in sorted(to_add):
-        ipr.addr('add', index=idx, address=ip, prefixlen=128)
-    for ip in sorted(to_del):
-        ipr.addr('del', index=idx, address=ip, prefixlen=128)
-    return to_add, to_del
+    net = IPv6Network(subnet, strict=False)
+    base = int(net.network_address)
+    out: List[str] = []
+    for i in range(1, count + 1):
+        addr_int = base + i
+        out.append(str(IPv6Network((addr_int, 128)).network_address))
+    return out
+
+
+def _run(args: List[str], check: bool = True, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, check=check, capture_output=True, text=True, input=input_text)
+
+
+def list_iface_ipv6(iface: str) -> Set[str]:
+    """
+    Возвращает множество IPv6 /128, назначенных на iface.
+    """
+    out = _run(["ip", "-6", "-o", "addr", "show", "dev", iface], check=False).stdout
+    have: Set[str] = set()
+    for line in out.splitlines():
+        parts = line.split()
+        for p in parts:
+            if ":" in p and "/" in p:
+                ip, plen = p.split("/", 1)
+                if plen == "128":
+                    have.add(ip)
+    return have
+
+
+def reconcile_ipv6_addresses(
+    iface: str,
+    desired: Iterable[str],
+    pinned: Iterable[str] = (),
+    remove_extras: bool = True,
+) -> Tuple[Set[str], Set[str]]:
+    """
+    Приводит список /128 на интерфейсе к desired.
+    pinned — адреса, которые нельзя удалять.
+    Возвращает (added, removed).
+    """
+    want = set(desired)
+    have = list_iface_ipv6(iface)
+    pin = set(pinned)
+
+    to_add = sorted(want - have)
+    to_del = sorted((have - want) - pin) if remove_extras else []
+
+    for ip in to_del:
+        _run(["ip", "-6", "addr", "del", f"{ip}/128", "dev", iface], check=False)
+
+    for ip in to_add:
+        # nodad = быстрее, без Duplicate Address Detection
+        _run(["ip", "-6", "addr", "add", f"{ip}/128", "dev", iface, "nodad"], check=True)
+
+    return set(to_add), set(to_del)

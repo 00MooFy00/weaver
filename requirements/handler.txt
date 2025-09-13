@@ -1,3 +1,2 @@
-PyYAML==6.0.1
-NetfilterQueue==1.1.0  # bindings для libnetfilter_queue
-python-json-logger==2.0.7
+NetfilterQueue>=1.1
+structlog>=24.1

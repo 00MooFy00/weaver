@@ -1,30 +1,28 @@
-import fcntl
+from __future__ import annotations
+
 import json
 import os
 import tempfile
+from pathlib import Path
 from typing import Any, Dict
 
-def read_state(path: str) -> Dict[str, Any]:
-    if not os.path.exists(path):
-        return {"version": 1, "mappings": []}
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
 
-def write_state_locked(path: str, obj: Dict[str, Any]) -> None:
-    lock_path = path + ".lock"
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(lock_path, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        tmp_fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path))
+def write_state_atomic(path: str, obj: Dict[str, Any]) -> None:
+    """
+    Атомарная запись JSON с временным файлом и заменой.
+    """
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".state.", suffix=".tmp", dir=str(p.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        os.chmod(path, 0o644)
+    finally:
         try:
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as tf:
-                json.dump(obj, tf, ensure_ascii=False, indent=2)
-                tf.flush()
-                os.fsync(tf.fileno())
-            os.replace(tmp_path, path)
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except FileNotFoundError:
-                pass
-            fcntl.flock(lf, fcntl.LOCK_UN)
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass

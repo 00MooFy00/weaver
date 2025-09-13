@@ -1,124 +1,101 @@
-import os
-import sys
-import time
-import json
-from typing import Dict, List, Set, Any, Tuple
-from .config_io import load_config
-from .state_io import read_state, write_state_locked
-from .ipam import allocate_random_ipv6, ensure_addrs_on_iface
-from .proxycfg import generate as gen_proxycfg
-from . import nft as nftmod
-from .util import json_log
+from __future__ import annotations
 
-PROXY_UID = 1337  # должен совпадать с UID пользователя в образе proxy
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
 
-def _validate_ports(groups) -> None:
-    for g in groups:
-        total = g.count
-        slots = g.port_range.end - g.port_range.start + 1
-        if total > slots:
-            raise ValueError(f"group {g.name}: count={total} > port slots={slots}")
+import typer
+import yaml
 
-def _build_state(config) -> Dict[str, Any]:
-    """
-    Строит и возвращает новый объект состояния, сохраняя стабильные привязки.
-    state: {"version":1,"mappings":[{"group":"...","port":30000,"ipv6":"..."}]}
-    """
-    state_path = config.global_.state_file_path
-    state = read_state(state_path)
-    old_map = state.get("mappings", [])
-    # индексы
-    by_group_port: Dict[Tuple[str, int], Dict[str, Any]] = {
-        (m["group"], int(m["port"])): m for m in old_map
-    }
+from weaver_manager.ipam import generate_ipv6_hosts, reconcile_ipv6_addresses
+from weaver_manager.models import Config
+from weaver_manager.nft import apply_nfqueue_rules
+# ВНИМАНИЕ: если у тебя файл называется proxy_conf.py — оставь как ниже.
+# Если ты использовал proxy_config.py — поменяй импорт на proxy_config.
+from weaver_manager.proxy_conf import render_3proxy_cfg, write_config
+from weaver_manager.state_io import write_state_atomic
 
-    new_mappings: List[Dict[str, Any]] = []
-    for g in config.proxy_groups:
-        _validate_ports([g])
-        # какие порты нам нужны
-        needed_ports = [g.port_range.start + i for i in range(g.count)]
-        # какие IPv6 уже закреплены за этими портами
-        have_ipv6 = {m["ipv6"] for k, m in by_group_port.items() if k[0] == g.name}
-        reserved = set(have_ipv6)
-        # добираем недостающие адреса
-        need = g.count - sum(1 for p in needed_ports if (g.name, p) in by_group_port)
-        addrs = allocate_random_ipv6(g.ipv6_subnet, need, reserved)
-        add_iter = iter(addrs)
-        for p in needed_ports:
-            key = (g.name, p)
-            if key in by_group_port:
-                ipv6 = by_group_port[key]["ipv6"]
-            else:
-                ipv6 = next(add_iter)
-            new_mappings.append({
-                "group": g.name,
-                "port": p,
-                "ipv6": ipv6,
-                "type": g.proxy_type,
-                "nfqueue_num": g.nfqueue_num
-            })
-    return {"version": 1, "mappings": new_mappings}
 
-def _services_from_state(state) -> List[Dict[str, Any]]:
-    out = []
-    for m in state["mappings"]:
-        out.append({"type": "http" if m["type"] == "http" else "socks5",
-                    "port": int(m["port"]),
-                    "external6": m["ipv6"]})
+app = typer.Typer(add_completion=False)
+
+
+@dataclass(frozen=True)
+class Binding:
+    port: int
+    ipv6: str
+    group: str
+    type: str
+
+
+def _calc_bindings(cfg: Config) -> List[Binding]:
+    out: List[Binding] = []
+    for g in cfg.proxy_groups:
+        ports = list(range(g.port_range.start, g.port_range.end + 1))
+        ips = generate_ipv6_hosts(g.ipv6_subnet, g.count)
+        for i in range(g.count):
+            out.append(Binding(port=ports[i], ipv6=ips[i], group=g.name, type=g.proxy_type))
     return out
 
-def apply():
-    cfg_path = os.environ.get("CONFIG_PATH", "/app/config/config.yaml")
-    cfg = load_config(cfg_path)
-    json_log("info", "config_loaded", path=cfg_path)
 
-    # 1) рассчитать новое состояние (с учётом старого)
-    new_state = _build_state(cfg)
-    # 2) привести IPv6 адреса на интерфейсе
-    desired_ipv6: Set[str] = {m["ipv6"] for m in new_state["mappings"]}
-    added, removed = ensure_addrs_on_iface(cfg.global_.ipv6_interface, desired_ipv6)
-    json_log("info", "ipam_reconciled", added=list(added), removed=list(removed))
+def do_apply(config_path: str) -> None:
+    cfg_raw = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+    cfg = Config.model_validate(cfg_raw)
 
-    # 3) сгенерировать 3proxy.cfg
-    services = _services_from_state(new_state)
-    gen_proxycfg(cfg.global_.proxy_config_path, cfg.global_.inbound_ipv4_address,
-                 cfg.global_.log_rotate_minutes, cfg.global_.proxy_dns, services)
-    json_log("info", "proxy_cfg_generated", path=cfg.global_.proxy_config_path, services=len(services))
+    # 1) рассчитать целевые биндинги
+    bindings = _calc_bindings(cfg)
 
-    # 4) применить nftables правила:
-    #    - матч по skuid 1337 (процесс 3proxy в контейнере proxy)
-    #    - queue fanout по диапазону очередей из config.global.nfqueue.numbers
-    nftmod.apply_rules(PROXY_UID, cfg.global_.nfqueue.numbers)
-    json_log("info", "nft_applied", uid=PROXY_UID, queues=cfg.global_.nfqueue.numbers)
+    # 2) IPv6 адреса на интерфейсе хоста
+    desired_ips = [b.ipv6 for b in bindings]
+    pinned = list(cfg.global_.pinned_ipv6)
+    added, removed = reconcile_ipv6_addresses(
+        cfg.global_.ipv6_interface, desired_ips, pinned=pinned, remove_extras=True
+    )
+    print(f"[manager] ipv6 +{len(added)} / -{len(removed)} on {cfg.global_.ipv6_interface}")
 
-    # 5) записать state атомарно
-    write_state_locked(cfg.global_.state_file_path, new_state)
-    json_log("info", "state_written", path=cfg.global_.state_file_path)
+    # 3) nft правила NFQUEUE (если задано)
+    queues = [g.nfqueue_num for g in cfg.proxy_groups if g.nfqueue_num is not None]
+    if queues:
+        apply_nfqueue_rules(queues)
+        print(f"[manager] nft NFQUEUE rules applied: {sorted(set(int(q) for q in queues))}")
 
-    # 6) послать 3proxy сигнал USR1 для перечтения конфига
-    #    выполняется в host netns, виден PID 3proxy (как процесс на хосте).
-    try:
-        os.system("pkill -USR1 -f '/usr/local/3proxy/bin/3proxy'")
-        json_log("info", "proxy_reloaded", method="SIGUSR1")
-    except Exception as e:
-        json_log("error", "proxy_reload_failed", error=str(e))
+    # 4) 3proxy.cfg + reload via monitor
+    btuples: List[Tuple[int, str, str]] = [(b.port, b.ipv6, b.type) for b in bindings]
+    bind_egress = cfg.global_.egress_bind != "off"
+    content = render_3proxy_cfg(cfg.global_.inbound_ipv4_address, btuples, bind_egress=bind_egress)
+    write_config(cfg.global_.proxy_config_path, "/run/3proxy/3proxy.ver", content)
+    print(f"[manager] 3proxy.cfg written and reload signalled")
 
-def main():
-    if len(sys.argv) < 2:
-        print("usage: manager apply|reload|flush", file=sys.stderr)
-        sys.exit(2)
-    cmd = sys.argv[1]
-    if cmd in ("apply", "reload"):
-        apply()
-    elif cmd == "flush":
-        # Опционально: очистка таблицы nft
-        import nftables
-        n = nftables.Nftables(); n.set_json_output(True)
-        n.json_cmd({"nftables": [{"delete": {"table": {"family": "inet", "name": "pw"}}}]})
-        print("flushed nft table inet pw")
-    else:
-        print(f"unknown command: {cmd}", file=sys.stderr)
-        sys.exit(2)
+    # 5) state.json для контроля
+    state: Dict[str, object] = {
+        "version": 2,
+        "groups": {
+            g.name: {
+                "subnet": g.ipv6_subnet,
+                "type": g.proxy_type,
+                "ports": [b.port for b in bindings if b.group == g.name],
+                "ipv6": [b.ipv6 for b in bindings if b.group == g.name],
+            }
+            for g in cfg.proxy_groups
+        },
+    }
+    write_state_atomic(cfg.global_.state_file_path, state)
+    print(f"[manager] state saved to {cfg.global_.state_file_path}")
+
+
+# === Fallback: если ты вызовешь БЕЗ подкоманды, просто с --config, мы всё равно применим ===
+@app.callback(invoke_without_command=True)
+def _default(ctx: typer.Context, config: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml")) -> None:
+    if ctx.invoked_subcommand is None:
+        if not config:
+            raise typer.BadParameter("Use --config to point to config.yaml or call 'apply --config ...'")
+        do_apply(config)
+
+
+# === Нормальная подкоманда ===
+@app.command()
+def apply(config: str = typer.Option(..., "--config", "-c", help="Path to config.yaml")) -> None:
+    do_apply(config)
+
 
 if __name__ == "__main__":
-    main()
+    app()

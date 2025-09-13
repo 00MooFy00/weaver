@@ -1,54 +1,62 @@
-version: "3.9"
+# Без "version": ключ устарел
+
+volumes:
+  proxy_conf:
+  proxy_run:
 
 services:
-  # 3proxy — по умолчанию в host-сети (быстро и просто).
-  # Альтернативы без host-сети см. в README (macvlan/tproxy).
   proxy:
-    build: ./services/proxy
-    container_name: weaver-proxy
-    network_mode: host
-    user: "1337:1337" # UID/GID процесса 3proxy, см. nft rules по skuid
+    build:
+      context: .
+      dockerfile: services/proxy/Dockerfile
+    container_name: weaver_proxy
+    restart: always
+    pid: "host"
+    network_mode: "none"
+    user: "0:0"                      # <— запускать от root (иначе капы неэффективны)
+    privileged: true
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
     volumes:
-      - ./config/3proxy.cfg:/etc/3proxy/3proxy.cfg:ro
-    restart: unless-stopped
-    environment:
-      - TZ=UTC
-    cap_add:
-      - NET_BIND_SERVICE
+      - proxy_conf:/usr/local/3proxy/conf
+      - proxy_run:/run/3proxy
+    command: [ "/usr/local/bin/nsenter-net.sh",
+               "/usr/local/3proxy/sbin/3proxy",
+               "/usr/local/3proxy/conf/3proxy.cfg" ]
 
-  # manager — однократно применяет конфигурацию (IPAM, nftables, 3proxy.cfg).
-  # Не требует доступа к docker.sock и не использует host-сеть.
-  manager:
-    build: ./services/manager
-    container_name: weaver-manager
-    pid: host                    # нужен доступ к /proc/1/ns/net
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
-      - SYS_ADMIN               # для nsenter в host netns
-    environment:
-      - CONFIG_PATH=/app/config/config.yaml
-    volumes:
-      - ./config:/app/config:rw
-      - ./state:/app/state:rw
-    # Запуск on-demand: docker compose run --rm manager apply
-    entrypoint: ["/entrypoint.sh"]
-    command: ["sleep", "infinity"]
-
-  # handler — долговременный сервис, слушает NFQUEUE в host netns и публикует /health
   handler:
-    build: ./services/handler
-    container_name: weaver-handler
-    pid: host
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
-      - SYS_ADMIN
-    environment:
-      - CONFIG_PATH=/app/config/config.yaml
+    build:
+      context: .
+      dockerfile: services/handler/Dockerfile
+    container_name: weaver_handler
+    restart: always
+    pid: "host"
+    network_mode: "none"
+    privileged: true
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    cap_add: [ "SYS_ADMIN","NET_ADMIN","NET_RAW" ]
     volumes:
       - ./config:/app/config:ro
-    restart: always
-    entrypoint: ["/entrypoint.sh"]
+    command: ["/app/bin/nsenter-net.sh", "python", "-m", "weaver_handler.main", "--config", "/app/config/config.yaml"]
 
-networks: {}
+  manager:
+    build:
+      context: .
+      dockerfile: services/manager/Dockerfile
+    container_name: weaver_manager
+    pid: "host"
+    network_mode: "none"
+    privileged: true
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    cap_add: [ "SYS_ADMIN","NET_ADMIN" ]
+    volumes:
+      - ./config:/app/config:ro
+      - ./state:/app/state
+      - proxy_conf:/usr/local/3proxy/conf
+      - proxy_run:/run/3proxy
+    command: ["/app/bin/nsenter-net.sh", "python", "-m", "weaver_manager.cli", "apply", "--config", "/app/config/config.yaml"]

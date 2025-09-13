@@ -1,51 +1,21 @@
-# Глобальные настройки
 global:
   state_file_path: /app/state/state.json
-  proxy_config_path: /app/config/3proxy.cfg
-  ipv6_interface: eth0                   # интерфейс хоста с IPv6-подсетью
-  inbound_ipv4_address: "0.0.0.0"        # bind адрес для клиентов
-  # Наблюдаемость
-  health:
-    listen: "127.0.0.1:9090"             # где слушать /health в handler
-    window_seconds: 60                   # событие по каждой очереди за последние N секунд
-  # NFQUEUE
-  nfqueue:
-    numbers: [0,1,2,3]                   # список номеров очередей, к которым привяжется handler
-    on_error: "accept"                   # "accept" или "drop" проблемный пакет
-    copy_range: 128                      # сколько байт копировать в userspace (экономия CPU)
-    max_len: 1024                        # глубина очереди в ядре (пакетов)
-  # 3proxy DNS/логирование
-  proxy_dns:
-    - 1.1.1.1
-    - 8.8.8.8
-  log_rotate_minutes: 60
+  proxy_config_path: /usr/local/3proxy/conf/3proxy.cfg
+  ipv6_interface: eth0
+  inbound_ipv4_address: "0.0.0.0"
+  log_level: INFO
+  egress_bind: "auto"      # "auto" | "off"
+  pinned_ipv6: []          # список /128, которые нельзя удалять
 
-# Справочник персон (оставлено как справочники; handler их не применяет)
-personas:
-  target_android_14:
-    ttl: 64
-    window_size: 65535
-    tcp_options_layout:
-      - { name: "MSS", value: "calc" }
-      - { name: "SACK" }
-      - { name: "Timestamps" }
-      - { name: "NOP" }
-      - { name: "WScale", value: 7 }
+observability:
+  health_bind: "127.0.0.1:9090"
+  health_interval_sec: 60
 
-# Группы прокси (state & генерация конфигов 3proxy)
 proxy_groups:
-  - name: "android-pool-1"
+  - name: pool1
     ipv6_subnet: "2a01:4f8:c0c:1234::/64"
     count: 100
-    proxy_type: "http"                   # "http" или "socks5"
-    port_range: { start: 30000, end: 30199 }
-    persona: "target_android_14"
-    nfqueue_num: 0
-
-  - name: "android-pool-2"
-    ipv6_subnet: "2a01:4f8:c0c:1235::/64"
-    count: 100
-    proxy_type: "socks5"
-    port_range: { start: 30200, end: 30399 }
-    persona: "target_android_14"
-    nfqueue_num: 1
+    proxy_type: "http"         # http | socks5
+    port_range: { start: 30000, end: 30099 }
+    nfqueue_num: 0             # null/отсутствует => не наблюдать эту группу (правило не ставим)
+    persona: null              # для совместимости поля, не используется в safe-режиме
