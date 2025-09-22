@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
+import socket
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Dict
 
 
 class HealthRegistry:
+    """
+    Tracks last-seen timestamps per NFQUEUE number.
+    """
+
     def __init__(self) -> None:
         self._last_seen: Dict[int, float] = {}
         self._lock = threading.Lock()
@@ -21,31 +25,66 @@ class HealthRegistry:
             return dict(self._last_seen)
 
 
-class HealthHandler(BaseHTTPRequestHandler):
-    registry: HealthRegistry = HealthRegistry()
-    interval_sec: int = 60
-
-    def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler)
-        if self.path != "/health":
-            self.send_response(404)
-            self.end_headers()
-            return
-        now = time.time()
-        snap = self.registry.snapshot()
-        ok = len(snap) > 0 and all((now - ts) <= self.interval_sec for ts in snap.values())
-        body = json.dumps(
-            {"ok": ok, "queues": {str(k): now - v for k, v in snap.items()}}, ensure_ascii=False
-        ).encode()
-        self.send_response(200 if ok else 503)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+def _parse_bind(bind_addr: str) -> tuple[str, int]:
+    """
+    Accept "127.0.0.1:9090" or "[::1]:9090".
+    """
+    if bind_addr.startswith("["):
+        host, port = bind_addr[1:].split("]:", 1)
+    else:
+        host, port = bind_addr.split(":", 1)
+    return host, int(port)
 
 
-def serve(bind: str, registry: HealthRegistry, interval_sec: int) -> None:
-    host, port_s = bind.rsplit(":", 1)
-    srv = HTTPServer((host, int(port_s)), HealthHandler)
-    HealthHandler.registry = registry
-    HealthHandler.interval_sec = interval_sec
-    srv.serve_forever()
+def serve(bind_addr: str, reg: HealthRegistry, interval_sec: int) -> None:
+    """
+    Very small HTTP server exposing /health.
+    Returns 200 if every known queue was seen within interval_sec.
+    Body: JSON with per-queue timestamps and global status.
+    """
+    host, port = _parse_bind(bind_addr)
+    s = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((host, port))
+    s.listen(32)
+
+    while True:
+        conn, _addr = s.accept()
+        try:
+            req = conn.recv(2048)
+            if b"GET /health" not in req:
+                conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                continue
+
+            now = time.time()
+            snaps = reg.snapshot()
+            ok = True
+            stale: Dict[int, float] = {}
+            for qn, ts in snaps.items():
+                if now - ts > interval_sec:
+                    ok = False
+                    stale[qn] = now - ts
+
+            body = json.dumps(
+                {
+                    "status": "ok" if ok else "stale",
+                    "interval_sec": interval_sec,
+                    "queues_seen": snaps,
+                    "stale_queues": stale,
+                    "ts": round(now, 3),
+                }
+            ).encode("utf-8")
+            status_line = b"HTTP/1.1 200 OK" if ok else b"HTTP/1.1 503 Service Unavailable"
+            headers = b"\r\n".join(
+                [
+                    status_line,
+                    b"Content-Type: application/json; charset=utf-8",
+                    f"Content-Length: {len(body)}".encode(),
+                    b"Connection: close",
+                    b"",
+                    b"",
+                ]
+            )
+            conn.sendall(headers + body)
+        finally:
+            conn.close()
