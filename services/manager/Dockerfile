@@ -1,16 +1,16 @@
-FROM python:3.11-slim-bookworm
+FROM python:3.9-slim-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    iproute2 nftables util-linux ca-certificates curl jq \
- && rm -rf /var/lib/apt/lists/*
+    iproute2 nftables ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY services/manager/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# контекст сборки — корень, поэтому так
-COPY requirements/manager.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY services/manager/weaver_manager/ /app/weaver_manager/
+COPY services/manager/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh && sed -i 's/\r$//' /entrypoint.sh
 
-COPY services/manager/ /app/
-RUN chmod +x /app/bin/nsenter-net.sh
+ENTRYPOINT ["/entrypoint.sh"]
 
-ENV PYTHONUNBUFFERED=1

@@ -33,3 +33,14 @@ services:
     restart: unless-stopped
     stop_grace_period: 10s
 
+  manager:
+    build:
+      context: .
+      dockerfile: services/manager/Dockerfile
+    image: weaver-manager
+    network_mode: "host"
+    cap_add: ["NET_ADMIN","NET_RAW"]
+    restart: "no"
+    volumes:
+      - ./config:/app/config
+      - ./state:/app/state
