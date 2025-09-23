@@ -1,62 +1,35 @@
-# Без "version": ключ устарел
-
-volumes:
-  proxy_conf:
-  proxy_run:
-
+version: "3.9"
 services:
-  proxy:
-    build:
-      context: .
-      dockerfile: services/proxy/Dockerfile
-    container_name: weaver_proxy
-    restart: always
-    pid: "host"
-    network_mode: "none"
-    user: "0:0"                      # <— запускать от root (иначе капы неэффективны)
-    privileged: true
-    security_opt:
-      - seccomp=unconfined
-      - apparmor=unconfined
-    volumes:
-      - proxy_conf:/usr/local/3proxy/conf
-      - proxy_run:/run/3proxy
-    command: [ "/usr/local/bin/nsenter-net.sh",
-               "/usr/local/3proxy/sbin/3proxy",
-               "/usr/local/3proxy/conf/3proxy.cfg" ]
-
   handler:
     build:
       context: .
       dockerfile: services/handler/Dockerfile
+    image: weaver-handler
     container_name: weaver_handler
-    restart: always
-    pid: "host"
-    network_mode: "none"
-    privileged: true
-    security_opt:
-      - seccomp=unconfined
-      - apparmor=unconfined
-    cap_add: [ "SYS_ADMIN","NET_ADMIN","NET_RAW" ]
+    network_mode: host
+    cap_add: ["NET_ADMIN", "NET_RAW"]
     volumes:
       - ./config:/app/config:ro
-    command: ["/app/bin/nsenter-net.sh", "python", "-m", "weaver_handler.main", "--config", "/app/config/config.yaml"]
+    environment:
+      - WEAVER_CONFIG=/app/config/config.yaml
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 10s
 
-  manager:
+  proxy:
     build:
       context: .
-      dockerfile: services/manager/Dockerfile
-    container_name: weaver_manager
-    pid: "host"
-    network_mode: "none"
-    privileged: true
-    security_opt:
-      - seccomp=unconfined
-      - apparmor=unconfined
-    cap_add: [ "SYS_ADMIN","NET_ADMIN" ]
+      dockerfile: services/proxy/Dockerfile
+    image: weaver-proxy
+    container_name: weaver_proxy
+    network_mode: host
+    cap_add: ["NET_ADMIN"]
     volumes:
       - ./config:/app/config:ro
-      - ./state:/app/state
-      - proxy_conf:/usr/local/3proxy/conf
-      - proxy_run:/run/3proxy
-    command: ["/app/bin/nsenter-net.sh", "python", "-m", "weaver_manager.cli", "apply", "--config", "/app/config/config.yaml"]
+    environment:
+      - WEAVER_CONFIG=/app/config/config.yaml
+      - PROXY_CFG=/app/config/3proxy.cfg
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 10s
+

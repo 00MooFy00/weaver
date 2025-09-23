@@ -1,0 +1,6 @@
+# Pinned minimal set for handler
+PyYAML>=6.0
+scapy>=2.6.0,<2.7.0
+NetfilterQueue>=0.1
+structlog>=24.1
+

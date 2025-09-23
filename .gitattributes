@@ -1,0 +1,11 @@
+# Нормализуем текстовые файлы в репо и форсируем LF на чек-ауте
+*          text=auto eol=lf
+
+# Скрипты и конфиги строго LF
+*.sh       text eol=lf
+Dockerfile* text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.py       text eol=lf
+*.cfg      text eol=lf
+

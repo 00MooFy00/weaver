@@ -7,27 +7,23 @@ from typing import Dict, List, Optional
 
 import yaml
 
-# Be robust to different module names across distros/pip
 try:
-    from netfilterqueue import NetfilterQueue  # preferred import
+    from netfilterqueue import NetfilterQueue  # preferred
 except Exception:  # pragma: no cover
     from NetfilterQueue import NetfilterQueue  # type: ignore
 
 from weaver_handler.health import HealthRegistry, serve
 from weaver_handler.util import json_log
+from weaver_handler.packet_mod import mutate_syn_payload
 
-# ----- Types -----
 PersonaConfig = Dict[str, int]
 
 
 def _tcp_flags_str(payload: bytes) -> str:
-    """
-    Return flags bits for quick debugging: IPv4:<bits> / IPv6:<bits> / other.
-    """
     if not payload:
         return "?"
     ver = payload[0] >> 4
-    if ver == 4:  # IPv4
+    if ver == 4:
         if len(payload) < 20:
             return "IPv4:short"
         ihl = (payload[0] & 0x0F) * 4
@@ -35,7 +31,7 @@ def _tcp_flags_str(payload: bytes) -> str:
             return "IPv4:short"
         flags = payload[ihl + 13]
         return f"IPv4:{flags:08b}"
-    if ver == 6:  # IPv6
+    if ver == 6:
         if len(payload) < 54:
             return "IPv6:short"
         nxt = payload[6]
@@ -48,8 +44,7 @@ def _tcp_flags_str(payload: bytes) -> str:
 
 def _load_cfg(path: str) -> dict:
     raw = Path(path).read_text(encoding="utf-8")
-    cfg = yaml.safe_load(raw) or {}
-    return cfg
+    return yaml.safe_load(raw) or {}
 
 
 def _worker(
@@ -57,39 +52,41 @@ def _worker(
     persona: Optional[PersonaConfig],
     reg: HealthRegistry,
     modify_packets: bool,
+    full_cfg: dict,
 ) -> None:
-    """
-    NFQUEUE worker for one queue number.
-    In current safe build, packets are only observed and accepted.
-    """
-
     def cb(pkt) -> None:
         try:
             reg.mark(queue_num)
             payload: bytes = pkt.get_payload()
             flags = _tcp_flags_str(payload)
 
-            # Safe mode: only observe/log. No modifications are performed here.
-            # If you run R&D in your owned lab, gate your logic behind `modify_packets`
-            # and apply transformations *only* for your test destinations.
-            action = "accept"
+            mutated = False
+            changes: Dict[str, object] = {}
+            if modify_packets:
+                new_payload, info = mutate_syn_payload(payload, full_cfg, persona)
+                mutated = bool(info.get("mutated"))
+                changes = info
+                if mutated and new_payload != payload:
+                    pkt.set_payload(new_payload)
+
             json_log(
                 "info",
                 "packet_observed",
                 queue=queue_num,
                 flags=flags,
-                persona_applied=False,
+                persona_applied=bool(persona),
                 modify_packets=modify_packets,
+                mutated=mutated,
+                changes=changes if mutated else None,
             )
             pkt.accept()
-        except Exception as e:  # Be fail-open per NFR
+        except Exception as e:
             json_log("error", "handler_exception", queue=queue_num, error=str(e))
             pkt.accept()
 
     q = NetfilterQueue()
-    # Some wrappers support additional kwargs; keep compatibility
     try:
-        q.bind(queue_num, cb, max_len=1024, range=128)  # may fail on older modules
+        q.bind(queue_num, cb, max_len=1024, range=128)
     except TypeError:
         q.bind(queue_num, cb)
     try:
@@ -104,7 +101,6 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = _load_cfg(args.config)
-
     proxy_groups = cfg.get("proxy_groups", [])
     personas_cfg: Dict[str, PersonaConfig] = cfg.get("personas", {})
 
@@ -114,7 +110,6 @@ def main() -> None:
     bind_addr = obs_cfg.get("health_bind", "127.0.0.1:9090")
     interval_sec = int(obs_cfg.get("health_interval_sec", 60))
 
-    # Map NFQUEUE -> persona (or None)
     queue_persona_map: Dict[int, Optional[PersonaConfig]] = {}
     for group in proxy_groups:
         qn = group.get("nfqueue_num")
@@ -128,16 +123,21 @@ def main() -> None:
                 json_log("error", "unknown_persona", queue=int(qn), persona=str(persona_name))
         queue_persona_map[int(qn)] = persona_conf
 
-    # Health server
-    reg = HealthRegistry()
-    threading.Thread(target=serve, args=(bind_addr, reg, interval_sec), daemon=True, name="health").start()
+    expected_queues = sorted(queue_persona_map.keys())
 
-    # Workers
+    reg = HealthRegistry()
+    threading.Thread(
+        target=serve,
+        args=(bind_addr, reg, interval_sec, expected_queues),
+        daemon=True,
+        name="health",
+    ).start()
+
     threads: List[threading.Thread] = []
     for qn, persona_conf in queue_persona_map.items():
         t = threading.Thread(
             target=_worker,
-            args=(qn, persona_conf, reg, modify_packets),
+            args=(qn, persona_conf, reg, modify_packets, cfg),
             name=f"nfqueue-{qn}",
             daemon=True,
         )
@@ -150,3 +150,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

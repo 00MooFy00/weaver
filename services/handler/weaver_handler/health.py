@@ -4,14 +4,10 @@ import json
 import socket
 import threading
 import time
-from typing import Dict
+from typing import Dict, Iterable, Set
 
 
 class HealthRegistry:
-    """
-    Tracks last-seen timestamps per NFQUEUE number.
-    """
-
     def __init__(self) -> None:
         self._last_seen: Dict[int, float] = {}
         self._lock = threading.Lock()
@@ -26,9 +22,6 @@ class HealthRegistry:
 
 
 def _parse_bind(bind_addr: str) -> tuple[str, int]:
-    """
-    Accept "127.0.0.1:9090" or "[::1]:9090".
-    """
     if bind_addr.startswith("["):
         host, port = bind_addr[1:].split("]:", 1)
     else:
@@ -36,12 +29,8 @@ def _parse_bind(bind_addr: str) -> tuple[str, int]:
     return host, int(port)
 
 
-def serve(bind_addr: str, reg: HealthRegistry, interval_sec: int) -> None:
-    """
-    Very small HTTP server exposing /health.
-    Returns 200 if every known queue was seen within interval_sec.
-    Body: JSON with per-queue timestamps and global status.
-    """
+def serve(bind_addr: str, reg: HealthRegistry, interval_sec: int, expected: Iterable[int]) -> None:
+    expect: Set[int] = set(expected or [])
     host, port = _parse_bind(bind_addr)
     s = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -60,17 +49,25 @@ def serve(bind_addr: str, reg: HealthRegistry, interval_sec: int) -> None:
             snaps = reg.snapshot()
             ok = True
             stale: Dict[int, float] = {}
-            for qn, ts in snaps.items():
-                if now - ts > interval_sec:
+            missing: Dict[int, str] = {}
+
+            for qn in sorted(expect):
+                ts = snaps.get(qn)
+                if ts is None:
                     ok = False
-                    stale[qn] = now - ts
+                    missing[qn] = "never"
+                elif now - ts > interval_sec:
+                    ok = False
+                    stale[qn] = round(now - ts, 3)
 
             body = json.dumps(
                 {
                     "status": "ok" if ok else "stale",
                     "interval_sec": interval_sec,
+                    "expected_queues": sorted(expect),
                     "queues_seen": snaps,
                     "stale_queues": stale,
+                    "missing_queues": missing,
                     "ts": round(now, 3),
                 }
             ).encode("utf-8")
@@ -88,3 +85,4 @@ def serve(bind_addr: str, reg: HealthRegistry, interval_sec: int) -> None:
             conn.sendall(headers + body)
         finally:
             conn.close()
+
