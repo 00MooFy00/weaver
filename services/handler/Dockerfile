@@ -1,20 +1,19 @@
-FROM python:3.9-slim-bookworm
+FROM python:3.11-slim
 
-# Нужны тулзы и dev-зависимости для сборки NetfilterQueue C-расширения
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential gcc pkg-config \
-    libnfnetlink-dev libnetfilter-queue-dev \
-    nftables iproute2 ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
+    iproute2 libnfnetlink0 libnetfilter-queue1 \
+    build-essential python3-dev \
+    libnfnetlink-dev libnetfilter-queue-dev libmnl-dev \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY requirements/handler.txt /app/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
+ && pip install --no-cache-dir -r /app/requirements.txt
 
-COPY services/handler/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY services/handler/weaver_handler/ /app/weaver_handler/
+COPY services/handler/ /app/weaver_handler/
 COPY services/handler/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh && sed -i 's/\r$//' /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
 

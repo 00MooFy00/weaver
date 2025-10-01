@@ -1,1 +1,2 @@
-__all__ = []
+from __future__ import annotations
+

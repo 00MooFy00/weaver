@@ -1,5 +1,4 @@
-# Pinned minimal set for handler
-PyYAML>=6.0
-scapy>=2.6.0,<2.7.0
-NetfilterQueue>=0.1
-structlog>=24.1
+netfilterqueue==1.1.0   # или 0.8 в вашей сборке — оставить совместимую
+scapy==2.5.0
+PyYAML==6.0.1
+ujson==5.9.0

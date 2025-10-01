@@ -1,0 +1,26 @@
+global:
+  state_file_path: /app/state/state.json
+  proxy_config_path: /run/3proxy/3proxy.cfg
+  ipv6_interface: eth0
+  inbound_ipv4_address: "0.0.0.0"
+  egress_bind: "off"          # в Dev не навязываем исходящий -e
+  pinned_ipv6: []
+  observe_enabled: false    # observe целиком OFF в Dev
+
+proxy_groups:
+  - name: pool1
+    ipv6_subnet: "fd00:1:2:3::/64"
+    count: 10
+    proxy_type: http
+    port_range: { start: 30000, end: 30099 }
+    listen_stack: ipv4
+    nfqueue_num: 10
+
+  - name: pool2
+    ipv6_subnet: "fd00:4:5:6::/64"
+    count: 5
+    proxy_type: socks5
+    port_range: { start: 30100, end: 30149 }
+    listen_stack: ipv4
+    nfqueue_num: 11
+

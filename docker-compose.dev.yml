@@ -1,0 +1,45 @@
+version: "3.9"
+
+services:
+  proxy:
+    build:
+      context: .
+      dockerfile: services/proxy/Dockerfile
+    container_name: weaver_proxy
+    privileged: true
+    pid: "host"  # nsenter -t 1 -n в host netns LinuxKit
+    security_opt:
+      - seccomp:unconfined
+      - apparmor:unconfined
+    environment:
+      - WEAVER_CONFIG=/app/config/config.yaml
+      - WEAVER_3PROXY_CFG=/run/3proxy/3proxy.cfg
+      - NSENTER_HOST_NET=1    # Dev/WSL: гоняем 3proxy в host netns
+      - NO_PORTGUARD=1        # Dev: nft/NFQUEUE ВЫКЛЮЧИТЬ
+    volumes:
+      - weaver_run:/run/3proxy
+      - ./config/config.dev.yaml:/app/config/config.yaml:ro
+    restart: unless-stopped
+
+  manager:
+    build:
+      context: .
+      dockerfile: services/manager/Dockerfile
+    container_name: weaver_manager
+    privileged: true
+    pid: "host"  # чтобы nsenter-ом можно было проверять порты из manager
+    security_opt:
+      - seccomp:unconfined
+      - apparmor:unconfined
+    volumes:
+      - weaver_run:/run/3proxy
+      - weaver_state:/app/state
+      - ./config/config.dev.yaml:/app/config/config.yaml:ro
+    entrypoint: ["/entrypoint.sh"]
+    command: ["apply", "--addr-mode", "skip", "--nft-mode", "none"]
+    # никаких observe/nft в Dev
+
+volumes:
+  weaver_run:
+  weaver_state:
+

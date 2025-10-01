@@ -1,31 +1,26 @@
-# Proxy Weaver (safe / observe mode)
+Proxy Weaver (safe / observe mode)
 
-Контейнерный каркас для управления пулом прокси (3proxy) и наблюдения за исходящими SYN через nftables/NFQUEUE.  
-**Без** подмены TCP-опций/TTL и прочих «маскировок»: только инфраструктура — адреса, конфиг, health, hot-reload.
+Контейнерный каркас для управления пулом прокси (3proxy) и наблюдения за исходящими SYN через nftables/NFQUEUE.
+Без подмены TCP-опций/TTL и прочих «маскировок»: только инфраструктура — адреса, конфиг, health, hot-reload.
 
----
+Архитектура
 
-## Архитектура
+proxy — контейнер с 3proxy, запускается в host netns через nsenter -t 1 -n, слушает диапазон портов, hot-reload конфига через monitor "/run/3proxy/3proxy.ver".
 
-- **proxy** — контейнер с 3proxy, запускается **в host netns** через `nsenter -t 1 -n`, слушает диапазон портов, hot-reload конфига через `monitor "/run/3proxy/3proxy.ver"`.
-- **manager** — одноразовая команда (идемпотентная): читает `config.yaml`, детерминированно генерит `/128` из заданного `/64`, навешивает недостающие адреса и снимает лишние, создаёт/обновляет nft-правила наблюдения, генерит `3proxy.cfg`, «тычёт» `monitor`.
-- **handler** (опционально) — слушает очереди NFQUEUE **только observe**, ничего не переписывает, отдаёт `/health`.
+manager — одноразовая команда (идемпотентная): читает config.yaml, детерминированно генерит /128 из заданного /64, навешивает недостающие адреса и снимает лишние, создаёт/обновляет nft-правила наблюдения, генерит 3proxy.cfg, «тычёт» monitor.
 
-> В dev на Docker Desktop/WSL: используем `nsenter` в **сетевой неймспейс хоста Docker (LinuxKit)**. Проверки делаем **через nsenter**, а не в своём WSL.
+handler (опционально) — слушает очереди NFQUEUE только observe, ничего не переписывает, отдаёт /health.
 
----
+В dev на Docker Desktop/WSL: используем nsenter в сетевой неймспейс хоста Docker (LinuxKit). Проверки делаем через nsenter, а не в своём WSL.
 
-## Требования
+Требования
 
-- **Prod:** чистый Debian 12 с Docker Engine и **реальной** делегированной подсетью IPv6 (/64 или /48) + маршрутизация от провайдера.
-- **Dev (Docker Desktop/WSL):** `nsenter` требует `CAP_SYS_ADMIN` и часто душится seccomp/apparmor → включены `privileged: true`, `seccomp=unconfined`, `apparmor=unconfined` в compose для удобства.  
-  IPv6 из коробки **не маршрутизируется** (нет NAT66, нет делегированного префикса) — см. раздел «IPv4 vs IPv6».
+Prod: чистый Debian 12 с Docker Engine и реальной делегированной подсетью IPv6 (/64 или /48) + маршрутизация от провайдера.
 
----
+Dev (Docker Desktop/WSL): nsenter требует CAP_SYS_ADMIN и часто душится seccomp/apparmor → включены privileged: true, seccomp=unconfined, apparmor=unconfined в compose для удобства.
+IPv6 из коробки не маршрутизируется (нет NAT66, нет делегированного префикса) — см. раздел «IPv4 vs IPv6».
 
-## Установка и сборка
-
-```bash
+Установка и сборка
 docker compose build
 
 # поднять долгоживущие (handler опционален)
@@ -33,10 +28,8 @@ docker compose up -d proxy handler
 
 # применить конфиг (идемпотентно), сгенерить /128, 3proxy.cfg и nft-правила
 docker compose run --rm manager
-```
 
-## Конфигурация (config/config.yaml)
-```Docker
+Конфигурация (config/config.yaml)
 global:
   state_file_path: /app/state/state.json
   proxy_config_path: /usr/local/3proxy/conf/3proxy.cfg
@@ -58,10 +51,8 @@ proxy_groups:
     port_range: { start: 30000, end: 30099 }
     nfqueue_num: 0                     # null/нет — не ставим queue-правило
     persona: null                      # совместимость; в safe-режиме не используется
-```
 
-## Проверка
-```
+Проверка
 # слушатели 3proxy
 docker compose run --rm manager /app/bin/nsenter-net.sh ss -ltnp | grep 3proxy | head
 
@@ -77,4 +68,4 @@ docker compose run --rm manager /app/bin/nsenter-net.sh nft list table inet weav
 
 # лог 3proxy
 docker compose run --rm manager sh -lc 'tail -n 120 /run/3proxy/3proxy.log'
-```
+

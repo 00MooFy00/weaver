@@ -4,85 +4,51 @@ import json
 import socket
 import threading
 import time
-from typing import Dict, Iterable, Set
+from typing import Dict, Iterable, List, Tuple
 
 
 class HealthRegistry:
-    def __init__(self) -> None:
-        self._last_seen: Dict[int, float] = {}
-        self._lock = threading.Lock()
+    def __init__(self, expected_queues: Iterable[int]) -> None:
+        self._last: Dict[int, float] = {q: 0.0 for q in expected_queues}
+        self._lock = threading.RLock()
 
-    def mark(self, queue_num: int) -> None:
+    def mark(self, q: int) -> None:
         with self._lock:
-            self._last_seen[queue_num] = time.time()
+            self._last[q] = time.time()
 
     def snapshot(self) -> Dict[int, float]:
         with self._lock:
-            return dict(self._last_seen)
+            return dict(self._last)
 
 
-def _parse_bind(bind_addr: str) -> tuple[str, int]:
-    if bind_addr.startswith("["):
-        host, port = bind_addr[1:].split("]:", 1)
-    else:
-        host, port = bind_addr.split(":", 1)
-    return host, int(port)
+def serve(bind: str, registry: HealthRegistry, interval: float = 1.0) -> None:
+    host, port = bind.split(":")
+    addr = (host, int(port))
+    fam = socket.AF_INET6 if ":" in host else socket.AF_INET
 
-
-def serve(bind_addr: str, reg: HealthRegistry, interval_sec: int, expected: Iterable[int]) -> None:
-    expect: Set[int] = set(expected or [])
-    host, port = _parse_bind(bind_addr)
-    s = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((host, port))
-    s.listen(32)
-
-    while True:
-        conn, _addr = s.accept()
-        try:
-            req = conn.recv(2048)
-            if b"GET /health" not in req:
-                conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
-                continue
-
-            now = time.time()
-            snaps = reg.snapshot()
-            ok = True
-            stale: Dict[int, float] = {}
-            missing: Dict[int, str] = {}
-
-            for qn in sorted(expect):
-                ts = snaps.get(qn)
-                if ts is None:
-                    ok = False
-                    missing[qn] = "never"
-                elif now - ts > interval_sec:
-                    ok = False
-                    stale[qn] = round(now - ts, 3)
-
-            body = json.dumps(
-                {
-                    "status": "ok" if ok else "stale",
-                    "interval_sec": interval_sec,
-                    "expected_queues": sorted(expect),
-                    "queues_seen": snaps,
+    with socket.socket(fam, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(addr)
+        s.listen(5)
+        while True:
+            conn, _ = s.accept()
+            with conn:
+                last = registry.snapshot()
+                now = time.time()
+                stale: List[int] = [q for q, ts in last.items() if now - ts > 60.0]
+                status = 200 if not stale else 503
+                body = {
+                    "status": "ok" if status == 200 else "stale",
                     "stale_queues": stale,
-                    "missing_queues": missing,
-                    "ts": round(now, 3),
+                    "last_seen": last,
                 }
-            ).encode("utf-8")
-            status_line = b"HTTP/1.1 200 OK" if ok else b"HTTP/1.1 503 Service Unavailable"
-            headers = b"\r\n".join(
-                [
-                    status_line,
-                    b"Content-Type: application/json; charset=utf-8",
-                    f"Content-Length: {len(body)}".encode(),
-                    b"Connection: close",
-                    b"",
-                    b"",
+                payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+                headers = [
+                    f"HTTP/1.1 {status} {'OK' if status==200 else 'Service Unavailable'}",
+                    "Content-Type: application/json; charset=utf-8",
+                    f"Content-Length: {len(payload)}",
+                    "Connection: close",
+                    "",
+                    "",
                 ]
-            )
-            conn.sendall(headers + body)
-        finally:
-            conn.close()
-
+                conn.sendall("\r\n".join(headers).encode("utf-8") + payload)

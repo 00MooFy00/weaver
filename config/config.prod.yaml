@@ -1,0 +1,51 @@
+global:
+  state_file_path: /app/state/state.json
+  ipv6_interface: eno1
+
+personas:
+  android_14:
+    hlim: 64
+    window: 65535
+    tcp_options_layout:
+      - { name: "MSS", value: 1460 }
+      - { name: "SACK" }
+      - { name: "Timestamps" }
+      - { name: "NOP" }
+      - { name: "WScale", value: 6 }
+
+  ios_17:
+    hlim: 64
+    window: 65535
+    tcp_options_layout:
+      - { name: "MSS", value: 1460 }
+      - { name: "SACK" }
+      - { name: "NOP" }
+      - { name: "NOP" }
+      - { name: "Timestamps" }
+      - { name: "WScale", value: 7 }
+
+  windows_11:
+    hlim: 128
+    window: 64240
+    tcp_options_layout:
+      - { name: "MSS", value: 1460 }
+      - { name: "SACK" }
+      - { name: "Timestamps" }
+      - { name: "WScale", value: 8 }
+
+# как выбирать персону:
+selection:
+  mode: weighted         # weighted | round_robin | per_port_bucket (поддержка в коде)
+  weighted:
+    - persona: android_14
+      weight: 5
+    - persona: ios_17
+      weight: 3
+    - persona: windows_11
+      weight: 2
+
+nfqueue:
+  number: 0
+  drop_on_error: false
+  health_port: 9090
+

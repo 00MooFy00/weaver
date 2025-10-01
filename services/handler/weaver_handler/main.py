@@ -1,153 +1,157 @@
 from __future__ import annotations
-
-import argparse
-import threading
-from pathlib import Path
-from typing import Dict, List, Optional
-
+import os, time, json, random, hashlib, threading
 import yaml
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-try:
-    from netfilterqueue import NetfilterQueue  # preferred
-except Exception:  # pragma: no cover
-    from NetfilterQueue import NetfilterQueue  # type: ignore
+from netfilterqueue import NetfilterQueue
+from scapy.all import IPv6, TCP
 
-from weaver_handler.health import HealthRegistry, serve
-from weaver_handler.util import json_log
-from weaver_handler.packet_mod import mutate_syn_payload
+CFG_PATH = os.environ.get("WEAVER_CONFIG", "/app/config/config.yaml")
+NFQ_NUM = int(os.environ.get("NFQUEUE_NUM", "0"))
 
-PersonaConfig = Dict[str, int]
+# ---- health ----
+_last_seen = 0.0
+_health_lock = threading.Lock()
 
+def _health_ok(within=60.0):
+    with _health_lock:
+        return (time.time() - _last_seen) <= within
 
-def _tcp_flags_str(payload: bytes) -> str:
-    if not payload:
-        return "?"
-    ver = payload[0] >> 4
-    if ver == 4:
-        if len(payload) < 20:
-            return "IPv4:short"
-        ihl = (payload[0] & 0x0F) * 4
-        if len(payload) < ihl + 14:
-            return "IPv4:short"
-        flags = payload[ihl + 13]
-        return f"IPv4:{flags:08b}"
-    if ver == 6:
-        if len(payload) < 54:
-            return "IPv6:short"
-        nxt = payload[6]
-        if nxt != 6:
-            return f"IPv6:nxt={nxt}"
-        flags = payload[40 + 13]
-        return f"IPv6:{flags:08b}"
-    return "?"
+def _mark_seen():
+    global _last_seen
+    with _health_lock:
+        _last_seen = time.time()
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        ok = _health_ok()
+        body = json.dumps({"ok": ok, "last_seen": _last_seen}).encode()
+        self.send_response(200 if ok else 500)
+        self.send_header("content-type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):  # quiet
+        pass
 
-def _load_cfg(path: str) -> dict:
-    raw = Path(path).read_text(encoding="utf-8")
-    return yaml.safe_load(raw) or {}
+def start_health_server(port=9090):
+    t = threading.Thread(target=lambda: HTTPServer(('127.0.0.1', port), HealthHandler).serve_forever(), daemon=True)
+    t.start()
 
+# ---- personas ----
+class Persona:
+    def __init__(self, name, hlim, window, layout):
+        self.name=name; self.hlim=hlim; self.window=window; self.layout=layout
 
-def _worker(
-    queue_num: int,
-    persona: Optional[PersonaConfig],
-    reg: HealthRegistry,
-    modify_packets: bool,
-    full_cfg: dict,
-) -> None:
-    def cb(pkt) -> None:
-        try:
-            reg.mark(queue_num)
-            payload: bytes = pkt.get_payload()
-            flags = _tcp_flags_str(payload)
-
-            mutated = False
-            changes: Dict[str, object] = {}
-            if modify_packets:
-                new_payload, info = mutate_syn_payload(payload, full_cfg, persona)
-                mutated = bool(info.get("mutated"))
-                changes = info
-                if mutated and new_payload != payload:
-                    pkt.set_payload(new_payload)
-
-            json_log(
-                "info",
-                "packet_observed",
-                queue=queue_num,
-                flags=flags,
-                persona_applied=bool(persona),
-                modify_packets=modify_packets,
-                mutated=mutated,
-                changes=changes if mutated else None,
-            )
-            pkt.accept()
-        except Exception as e:
-            json_log("error", "handler_exception", queue=queue_num, error=str(e))
-            pkt.accept()
-
-    q = NetfilterQueue()
-    try:
-        q.bind(queue_num, cb, max_len=1024, range=128)
-    except TypeError:
-        q.bind(queue_num, cb)
-    try:
-        q.run()
-    finally:
-        q.unbind()
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True, help="Path to config.yaml")
-    args = ap.parse_args()
-
-    cfg = _load_cfg(args.config)
-    proxy_groups = cfg.get("proxy_groups", [])
-    personas_cfg: Dict[str, PersonaConfig] = cfg.get("personas", {})
-
-    handler_cfg = cfg.get("handler", {})
-    modify_packets: bool = bool(handler_cfg.get("modify_packets", False))
-    obs_cfg = cfg.get("observability", {})
-    bind_addr = obs_cfg.get("health_bind", "127.0.0.1:9090")
-    interval_sec = int(obs_cfg.get("health_interval_sec", 60))
-
-    queue_persona_map: Dict[int, Optional[PersonaConfig]] = {}
-    for group in proxy_groups:
-        qn = group.get("nfqueue_num")
-        if qn is None:
-            continue
-        persona_name = group.get("persona")
-        persona_conf = None
-        if persona_name:
-            persona_conf = personas_cfg.get(str(persona_name)) or personas_cfg.get(persona_name)
-            if persona_conf is None:
-                json_log("error", "unknown_persona", queue=int(qn), persona=str(persona_name))
-        queue_persona_map[int(qn)] = persona_conf
-
-    expected_queues = sorted(queue_persona_map.keys())
-
-    reg = HealthRegistry()
-    threading.Thread(
-        target=serve,
-        args=(bind_addr, reg, interval_sec, expected_queues),
-        daemon=True,
-        name="health",
-    ).start()
-
-    threads: List[threading.Thread] = []
-    for qn, persona_conf in queue_persona_map.items():
-        t = threading.Thread(
-            target=_worker,
-            args=(qn, persona_conf, reg, modify_packets, cfg),
-            name=f"nfqueue-{qn}",
-            daemon=True,
+def load_config(path):
+    with open(path, 'r') as f:
+        cfg = yaml.safe_load(f)
+    personas={}
+    for name, p in cfg.get('personas', {}).items():
+        personas[name]=Persona(
+            name=name,
+            hlim=int(p.get('hlim', 64)),
+            window=int(p.get('window', 65535)),
+            layout=p.get('tcp_options_layout', [])
         )
-        t.start()
-        threads.append(t)
+    sel = cfg.get('selection', {"mode":"weighted","weighted":[{"persona":list(personas)[0],"weight":1}]})
+    nfq = cfg.get('nfqueue', {"number": NFQ_NUM, "drop_on_error": False, "health_port": 9090})
+    return personas, sel, nfq
 
-    for t in threads:
-        t.join()
+def stable_choice_weighted(personas, sel, key_bytes: bytes):
+    # deterministic pick by hashing key -> [0,1)
+    h = hashlib.blake2b(key_bytes, digest_size=8).digest()
+    val = int.from_bytes(h, 'big') / float(2**64)
+    total = sum(float(w["weight"]) for w in sel["weighted"])
+    acc=0.0
+    for w in sel["weighted"]:
+        acc += float(w["weight"]) / total
+        if val <= acc:
+            return personas[w["persona"]]
+    return personas[sel["weighted"][-1]["persona"]]
 
+def build_tcp_options(layout):
+    opts=[]
+    ts_now = int(time.time()) & 0xffffffff
+    for item in layout:
+        name=item.get("name","")
+        if name == "MSS":
+            val=int(item.get("value",1460)); opts.append(('MSS', val))
+        elif name == "SACK":
+            opts.append(('SAckOK',''))
+        elif name == "Timestamps":
+            opts.append(('Timestamp', (ts_now, 0)))
+        elif name == "WScale":
+            val=int(item.get("value",7)); opts.append(('WScale', val))
+        elif name == "NOP":
+            opts.append(('NOP', None))
+        else:
+            # ignore/unknown
+            pass
+    return opts
+
+def apply_persona(pkt: IPv6, persona: Persona):
+    # IPv6 hop limit
+    pkt.hlim = persona.hlim
+    # TCP window/options
+    tcp = pkt.getlayer(TCP)
+    tcp.window = persona.window
+    tcp.options = build_tcp_options(persona.layout)
+    # recalc lengths/checksums
+    if hasattr(pkt, 'plen'): del pkt.plen
+    if hasattr(tcp, 'chksum'): del tcp.chksum
+    return pkt
+
+def callback(packet):
+    try:
+        payload = packet.get_payload()
+        pkt = IPv6(payload)
+        if not pkt.haslayer(TCP):
+            packet.accept(); return
+        tcp = pkt.getlayer(TCP)
+        # только первичный SYN (без ACK)
+        if not (tcp.flags & 0x02) or (tcp.flags & 0x10):
+            packet.accept(); return
+
+        key = f"{pkt.src}|{pkt.dst}|{tcp.sport}|{tcp.dport}|6".encode()
+        persona = stable_choice_weighted(PERSONAS, SELECTION, key)
+        new_pkt = apply_persona(pkt, persona)
+
+        packet.set_payload(bytes(new_pkt))
+        packet.accept()
+        _mark_seen()
+        print(json.dumps({
+            "ts": time.time(),
+            "event": "syn_modified",
+            "persona": persona.name,
+            "dst": pkt.dst,
+            "dport": tcp.dport
+        }), flush=True)
+    except Exception as e:
+        print(json.dumps({"ts": time.time(), "event": "error", "err": str(e)}), flush=True)
+        if NFQ_DROP_ON_ERR:
+            packet.drop()
+        else:
+            packet.accept()
 
 if __name__ == "__main__":
-    main()
+    PERSONAS, SELECTION, nfq = load_config(CFG_PATH)
+    NFQ_NUM = int(nfq.get("number", NFQ_NUM))
+    NFQ_DROP_ON_ERR = bool(nfq.get("drop_on_error", False))
+    start_health_server(int(nfq.get("health_port", 9090)))
 
+    print(json.dumps({
+        "ts": time.time(),
+        "event": "handler_start",
+        "nfqueue": NFQ_NUM,
+        "personas": list(PERSONAS.keys()),
+        "selection": SELECTION
+    }), flush=True)
+
+    q = NetfilterQueue()
+    q.bind(NFQ_NUM, callback, 0xffff)
+    try:
+        q.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        q.unbind()

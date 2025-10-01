@@ -1,0 +1,70 @@
+version: "3.9"
+
+volumes:
+  weaver_state: {}
+
+services:
+  setup:
+    image: weaver-setup
+    build:
+      context: .
+      dockerfile: services/setup/Dockerfile
+    container_name: weaver_setup
+    network_mode: host
+    pid: host
+    cap_add: [NET_ADMIN, SYS_ADMIN]
+    restart: unless-stopped
+    environment:
+      IPV6_INTERFACE: "eno1"                      # адаптируй под свой интерфейс
+      IPV6_SUBNET: "2a01:4f8:c0c:1234::/64"       # твоя /64
+      NFQUEUE_NUM: "0"
+      PROXY_UID: "1337"
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/setup_done"]
+      interval: 2s
+      timeout: 1s
+      retries: 20
+
+  proxy:
+    image: weaver-proxy
+    build:
+      context: .
+      dockerfile: services/proxy/Dockerfile
+    container_name: weaver_proxy
+    network_mode: "host"
+    restart: unless-stopped
+    depends_on:
+      setup:
+        condition: service_healthy
+    environment:
+      PROXY_PORT_START: "30000"
+      PROXY_PORT_COUNT: "64"
+      PROXY_LISTEN_IP: "::"
+    volumes:
+      - type: bind
+        source: ./run_3proxy
+        target: /run/3proxy
+      # используем наш entrypoint из репо (удобно для правок без пересборки)
+      - ./services/proxy/bin/entrypoint.sh:/usr/local/sbin/proxy-entry.sh:ro
+      - weaver_state:/app/state
+      - ./config/config.prod.yaml:/app/config/config.yaml:ro
+
+  handler:
+    image: weaver-handler
+    build:
+      context: .
+      dockerfile: services/handler/Dockerfile
+    container_name: weaver_handler
+    network_mode: host
+    cap_add: [NET_ADMIN, NET_RAW]
+    restart: unless-stopped
+    depends_on:
+      setup:
+        condition: service_healthy
+    environment:
+      WEAVER_CONFIG: /app/config/config.yaml
+      NFQUEUE_NUM: "0"
+    volumes:
+      - weaver_state:/app/state
+      - ./config/config.prod.yaml:/app/config/config.yaml:ro
+
